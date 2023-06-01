@@ -36,6 +36,7 @@
 
 struct cma cma_areas[MAX_CMA_AREAS];
 unsigned cma_area_count;
+static DEFINE_MUTEX(cma_mutex);
 
 phys_addr_t cma_get_base(const struct cma *cma)
 {
@@ -441,8 +442,7 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 	struct page *page = NULL;
 	int ret = -ENOMEM;
 	int retry_after_sleep = 0;
-	int max_retries = 2;
-	int available_regions = 0;
+	int max_retries = 5;
 
 	if (!cma || !cma->count)
 		return NULL;
@@ -471,14 +471,6 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 		if (bitmap_no >= bitmap_maxno) {
 			if ((retry_after_sleep < max_retries) &&
 						(ret == -EBUSY)) {
-				start = 0;
-				/*
-				 * update max retries if available free regions
-				 * are less.
-				 */
-				if (available_regions < 3)
-					max_retries = 5;
-				available_regions = 0;
 				/*
 				 * Page may be momentarily pinned by some other
 				 * process which has been scheduled out, eg.
@@ -488,6 +480,10 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 				 * been freed later.
 				 */
 				mutex_unlock(&cma->lock);
+				if (fatal_signal_pending(current))
+					break;
+				start = 0;
+				ret = -ENOMEM;
 				msleep(100);
 				retry_after_sleep++;
 				continue;
@@ -497,7 +493,6 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 			}
 		}
 
-		available_regions++;
 		bitmap_set(cma->bitmap, bitmap_no, bitmap_count);
 		/*
 		 * It's safe to drop the lock here. We've marked this region for
@@ -507,8 +502,10 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 		mutex_unlock(&cma->lock);
 
 		pfn = cma->base_pfn + (bitmap_no << cma->order_per_bit);
+		mutex_lock(&cma_mutex);
 		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA,
 				     GFP_KERNEL | (no_warn ? __GFP_NOWARN : 0));
+		mutex_unlock(&cma_mutex);
 
 		if (ret == 0) {
 			page = pfn_to_page(pfn);
